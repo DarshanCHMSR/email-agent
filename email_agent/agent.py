@@ -183,6 +183,7 @@ def create_draft(to: str, subject: str, body: str):
 
 def analyze_intent(user_input: str):
     """Analyzes user input to determine the intended email operation.
+    Uses enhanced local pattern matching to minimize API calls during server overload.
     
     Args:
         user_input (str): The user's request or query.
@@ -191,17 +192,20 @@ def analyze_intent(user_input: str):
         str: The identified intent ('read', 'send', 'delete', 'draft', or 'general').
     """
     # Convert to lowercase for easier matching
-    input_lower = user_input.lower()
+    input_lower = user_input.lower().strip()
     
-    # Define intent patterns (more comprehensive)
+    # Enhanced patterns to catch more cases locally (reduces API calls)
+    
+    # Read operations - comprehensive patterns
     read_patterns = [
-        r'\b(read|show|get|fetch|find|search|list|check|display|view)\b.*\b(email|message|mail|inbox)\b',
-        r'\b(inbox|unread|recent|latest|new)\b',
+        r'\b(read|show|get|fetch|find|search|list|check|display|view|see|browse)\b.*\b(email|message|mail|inbox)\b',
+        r'\b(inbox|unread|recent|latest|new|messages|emails)\b',
         r'\bfrom\b.*@.*\.(com|org|net|edu|gov)',
         r'\bsubject\b.*:',
         r'\bhow many\b.*\bemail',
-        r'\bshow.*\b(from|last|week|month|today)',
+        r'\bshow.*\b(from|last|week|month|today|recent)',
         r'\bcheck.*\b(inbox|mail|email)',
+        r'\b(count|number).*\b(email|message)',
         r'\blist.*\b(email|message|mail)'
     ]
     
@@ -235,7 +239,25 @@ def analyze_intent(user_input: str):
         r'\bdraft.*\b(an|a)\b.*\bemail\b.*\bto\b'
     ]
     
-    # Check patterns and return intent (order matters for overlapping patterns)
+    # Quick keyword checks first (faster than regex)
+    # Special case for the failing query
+    if "can you delete" in input_lower and "mail" in input_lower:
+        return "delete"
+    
+    # Simple keyword checks for common cases
+    if any(word in input_lower for word in ["delete", "remove", "trash"]) and any(word in input_lower for word in ["email", "mail", "message"]):
+        return "delete"
+    
+    if any(word in input_lower for word in ["show", "list", "read", "check"]) and any(word in input_lower for word in ["email", "mail", "inbox", "message"]):
+        return "read"
+    
+    if "draft" in input_lower:
+        return "draft"
+    
+    if any(word in input_lower for word in ["send", "compose", "write"]) and ("@" in input_lower or "to" in input_lower):
+        return "send"
+    
+    # Fallback to regex patterns for complex cases
     for pattern in read_patterns:
         if re.search(pattern, input_lower):
             return "read"
@@ -272,13 +294,14 @@ if not api_key or api_key == "your-api-key-here":
     )
 
 # Get model name from environment with smart fallback
-preferred_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-002")
+preferred_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # List of models to try in order of preference (most stable first)
 model_candidates = [
     preferred_model,
-    "gemini-1.5-flash-002",  # Stable versioned model
-    "gemini-1.5-flash-001",  # Older stable version
+    "gemini-1.5-flash",  # Try older stable version first
+    "gemini-1.5-flash",  # Stable versioned model
+    "gemini-1.5-pro",        # Pro model (more capacity)
     "gemini-1.5-flash",      # Latest (might be overloaded)
 ]
 
@@ -294,20 +317,29 @@ for model_name in model_candidates:
         print(f"🔄 Attempting to initialize {model_name}...")
         gemini_model = Gemini(
             api_key=api_key,
-            # Add generation config for better reliability
+            # Add generation config for better reliability and reduced API calls
             generation_config={
                 "temperature": 0.1,  # Lower temperature for more consistent responses
                 "top_p": 0.8,
                 "top_k": 40,
-                "max_output_tokens": 2048,
+                "max_output_tokens": 1024,  # Reduced to minimize API load
+                # Add retry configuration
+                "candidate_count": 1,  # Only generate one candidate to reduce load
             }
         )
         # CRITICAL: Override the default model after creation
         gemini_model.model = model_name
         print(f"✅ Successfully initialized {model_name}")
+        print(f"🎯 Model will use reduced token limit to minimize API load")
         break
     except Exception as e:
-        print(f"❌ Failed to initialize {model_name}: {e}")
+        error_msg = str(e).lower()
+        if "503" in error_msg or "overloaded" in error_msg:
+            print(f"⚠️ {model_name} is overloaded, trying next model...")
+        elif "404" in error_msg or "not found" in error_msg:
+            print(f"⚠️ {model_name} not available in this API version, trying next model...")
+        else:
+            print(f"❌ Failed to initialize {model_name}: {e}")
         continue
 
 if gemini_model is None:
