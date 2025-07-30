@@ -1,0 +1,6 @@
+@echo off
+echo Restarting ADK Web Server with updated model configuration...
+cd /d "c:\Users\Darsh\OneDrive\Desktop\full stack\Msrit-internship\email"
+call .\venv\Scripts\activate
+echo Starting ADK web server...
+adk web .
