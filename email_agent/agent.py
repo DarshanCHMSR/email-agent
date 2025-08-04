@@ -11,6 +11,7 @@ import base64
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import re
+from typing import Optional
 
 # Load environment variables from .env file
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +22,8 @@ load_dotenv(env_path)
 # If modifying these scopes, delete the file token.json.
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar"
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive"
 ]
 
 def get_gmail_service():
@@ -69,9 +71,33 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
-# Gmail and Calendar services will be initialized when needed
+def get_drive_service():
+    """Initialize Google Drive service with the same credentials as Gmail and Calendar"""
+    creds = None
+    # Get the directory of the current file
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    
+    token_path = os.path.join(parent_dir, "token.json")
+    credentials_path = os.path.join(parent_dir, "credentials.json")
+    
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(token_path, "w") as token:
+            token.write(creds.to_json())
+    return build("drive", "v3", credentials=creds)
+
+
+# Gmail, Calendar, and Drive services will be initialized when needed
 gmail_service = None
 calendar_service = None
+drive_service = None
 
 def ensure_gmail_service():
     """Lazy initialization of Gmail service"""
@@ -87,6 +113,14 @@ def ensure_calendar_service():
     if calendar_service is None:
         calendar_service = get_calendar_service()
     return calendar_service
+
+
+def ensure_drive_service():
+    """Lazy initialization of Drive service"""
+    global drive_service
+    if drive_service is None:
+        drive_service = get_drive_service()
+    return drive_service
 
 
 def read_emails(query: str, num_emails: int):
@@ -358,6 +392,188 @@ def update_calendar_event(event_id: str, summary: str = "", start_datetime: str 
         return f"An error occurred while updating calendar event: {error}"
 
 
+# Google Drive Functions
+def list_drive_files(query: str = "", max_results: int = 10):
+    """Lists files from Google Drive based on a search query.
+
+    Args:
+        query (str): Search query to filter files (e.g., "type:pdf" or "name:report").
+        max_results (int): Maximum number of files to return (1-100).
+
+    Returns:
+        str: A summary of the files found, or a message indicating no files were found.
+    """
+    # Ensure max_results is within reasonable bounds
+    if max_results <= 0:
+        max_results = 10
+    elif max_results > 100:
+        max_results = 100
+    
+    try:
+        service = ensure_drive_service()
+        
+        # Build search query
+        search_query = query if query else ""
+        
+        results = service.files().list(
+            q=search_query,
+            pageSize=max_results,
+            fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, webViewLink, parents)"
+        ).execute()
+        
+        files = results.get('files', [])
+        
+        if not files:
+            return f"No files found matching query: '{query}'" if query else "No files found in your Drive."
+        
+        file_list = []
+        for file in files:
+            name = file.get('name', 'Unknown')
+            file_id = file.get('id', 'Unknown')
+            mime_type = file.get('mimeType', 'Unknown')
+            size = file.get('size', 'Unknown size')
+            modified = file.get('modifiedTime', 'Unknown date')
+            web_link = file.get('webViewLink', 'No link')
+            
+            # Convert size to readable format if available
+            if size != 'Unknown size' and size.isdigit():
+                size_bytes = int(size)
+                if size_bytes < 1024:
+                    size_str = f"{size_bytes} bytes"
+                elif size_bytes < 1024 * 1024:
+                    size_str = f"{size_bytes / 1024:.1f} KB"
+                elif size_bytes < 1024 * 1024 * 1024:
+                    size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+                else:
+                    size_str = f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+            else:
+                size_str = "Unknown size"
+            
+            file_list.append(
+                f"📄 Name: {name}\n"
+                f"   ID: {file_id}\n"
+                f"   Type: {mime_type}\n"
+                f"   Size: {size_str}\n"
+                f"   Modified: {modified}\n"
+                f"   Link: {web_link}\n---"
+            )
+        
+        return f"Found {len(files)} files:\n\n" + "\n".join(file_list)
+    
+    except HttpError as error:
+        return f"An error occurred while listing Drive files: {error}"
+
+
+def create_drive_folder(folder_name: str, parent_folder_id: Optional[str] = None):
+    """Creates a new folder in Google Drive.
+
+    Args:
+        folder_name (str): Name of the folder to create.
+        parent_folder_id (str): ID of the parent folder (optional, defaults to root).
+
+    Returns:
+        str: Success message with folder ID and link, or error message.
+    """
+    try:
+        service = ensure_drive_service()
+        
+        folder_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        
+        # Add parent folder if specified
+        if parent_folder_id:
+            folder_metadata['parents'] = [parent_folder_id]
+        
+        folder = service.files().create(
+            body=folder_metadata,
+            fields='id, webViewLink'
+        ).execute()
+        
+        folder_id = folder.get('id')
+        web_link = folder.get('webViewLink')
+        
+        return f"Folder '{folder_name}' created successfully!\nFolder ID: {folder_id}\nLink: {web_link}"
+    
+    except HttpError as error:
+        return f"An error occurred while creating Drive folder: {error}"
+
+
+def delete_drive_file(file_id: str):
+    """Deletes a file or folder from Google Drive.
+
+    Args:
+        file_id (str): The ID of the file or folder to delete.
+
+    Returns:
+        str: Success or error message.
+    """
+    try:
+        service = ensure_drive_service()
+        
+        # Get file info first for confirmation
+        file_info = service.files().get(fileId=file_id, fields='name, mimeType').execute()
+        file_name = file_info.get('name', 'Unknown')
+        file_type = "folder" if file_info.get('mimeType') == 'application/vnd.google-apps.folder' else "file"
+        
+        # Delete the file
+        service.files().delete(fileId=file_id).execute()
+        
+        return f"Successfully deleted {file_type} '{file_name}' (ID: {file_id})"
+    
+    except HttpError as error:
+        if error.resp.status == 404:
+            return f"File with ID '{file_id}' not found. It may have already been deleted."
+        return f"An error occurred while deleting Drive file: {error}"
+
+
+def share_drive_file(file_id: str, email: str, role: str = "reader"):
+    """Shares a Google Drive file with a specific user.
+
+    Args:
+        file_id (str): The ID of the file to share.
+        email (str): Email address of the user to share with.
+        role (str): Permission level - "reader", "writer", or "owner".
+
+    Returns:
+        str: Success or error message.
+    """
+    try:
+        service = ensure_drive_service()
+        
+        # Validate role
+        valid_roles = ["reader", "writer", "owner"]
+        if role not in valid_roles:
+            return f"Invalid role '{role}'. Valid roles are: {', '.join(valid_roles)}"
+        
+        # Get file info
+        file_info = service.files().get(fileId=file_id, fields='name, webViewLink').execute()
+        file_name = file_info.get('name', 'Unknown')
+        web_link = file_info.get('webViewLink', 'No link')
+        
+        # Create permission
+        permission = {
+            'type': 'user',
+            'role': role,
+            'emailAddress': email
+        }
+        
+        service.permissions().create(
+            fileId=file_id,
+            body=permission,
+            fields='id',
+            sendNotificationEmail=True
+        ).execute()
+        
+        return f"Successfully shared '{file_name}' with {email} as {role}.\nFile link: {web_link}"
+    
+    except HttpError as error:
+        if error.resp.status == 404:
+            return f"File with ID '{file_id}' not found."
+        return f"An error occurred while sharing Drive file: {error}"
+
+
 def analyze_intent(user_input: str):
     """Analyzes user input to determine the intended operation.
     Uses enhanced local pattern matching to minimize API calls during server overload.
@@ -366,12 +582,46 @@ def analyze_intent(user_input: str):
         user_input (str): The user's request or query.
         
     Returns:
-        str: The identified intent ('read', 'send', 'delete', 'draft', 'calendar_create', 'calendar_read', 'calendar_delete', 'calendar_update', or 'general').
+        str: The identified intent ('read', 'send', 'delete', 'draft', 'calendar_create', 'calendar_read', 'calendar_delete', 'calendar_update', 'drive_list', 'drive_create', 'drive_delete', 'drive_share', or 'general').
     """
     # Convert to lowercase for easier matching
     input_lower = user_input.lower().strip()
     
     # Enhanced patterns to catch more cases locally (reduces API calls)
+    
+    # Drive operations patterns
+    drive_list_patterns = [
+        r'\b(list|show|find|search|get|view|display)\b.*\b(files|drive|documents|folder|folders)\b',
+        r'\bmy\b.*\b(drive|files|documents|folders)\b',
+        r'\b(what|show).*\b(files|documents)\b.*\b(in|on)\b.*\bdrive\b',
+        r'\bshow.*\bdrive\b.*\b(files|content)\b',
+        r'\b(browse|explore)\b.*\bdrive\b',
+        r'\b(recent|latest)\b.*\b(files|documents)\b.*\bdrive\b'
+    ]
+    
+    drive_create_patterns = [
+        r'\b(create|make|new)\b.*\b(folder|directory)\b',
+        r'\b(add|create)\b.*\b(folder|directory)\b.*\b(to|in)\b.*\bdrive\b',
+        r'\bmake.*\b(new|a)\b.*\bfolder\b',
+        r'\bcreate.*\bfolder\b.*\b(named|called)\b',
+        r'\bnew\b.*\b(folder|directory)\b.*\bdrive\b'
+    ]
+    
+    drive_delete_patterns = [
+        r'\b(delete|remove|trash)\b.*\b(file|folder|document)\b',
+        r'\bdelete\b.*\bfrom\b.*\bdrive\b',
+        r'\bremove\b.*\b(file|folder|document)\b.*\bdrive\b',
+        r'\btrash\b.*\b(file|folder)\b',
+        r'\b(clean|clear)\b.*\bdrive\b'
+    ]
+    
+    drive_share_patterns = [
+        r'\b(share|grant|give)\b.*\b(access|permission)\b',
+        r'\bshare\b.*\b(file|folder|document)\b.*\bwith\b',
+        r'\b(give|grant)\b.*\b(access|permission)\b.*\bto\b',
+        r'\bshare\b.*\bdrive\b.*\bfile\b',
+        r'\bmake.*\b(public|shared|accessible)\b'
+    ]
     
     # Calendar operations patterns
     calendar_create_patterns = [
@@ -452,6 +702,20 @@ def analyze_intent(user_input: str):
     ]
     
     # Quick keyword checks first (faster than regex)
+    # Drive checks first
+    if any(word in input_lower for word in ["share", "grant", "give"]) and any(word in input_lower for word in ["access", "permission", "with", "to"]):
+        return "drive_share"
+    
+    if any(word in input_lower for word in ["list", "show", "find", "browse"]) and any(word in input_lower for word in ["files", "drive", "documents", "folder"]):
+        return "drive_list"
+    
+    if any(word in input_lower for word in ["create", "make", "new"]) and any(word in input_lower for word in ["folder", "directory"]):
+        return "drive_create"
+    
+    # Check for drive delete (be careful not to conflict with email delete)
+    if any(word in input_lower for word in ["delete", "remove", "trash"]) and any(word in input_lower for word in ["file", "folder", "document", "drive"]):
+        return "drive_delete"
+    
     # Calendar checks - reschedule should be checked first since it's specific
     if "reschedule" in input_lower and any(word in input_lower for word in ["meeting", "event", "appointment", "the meeting", "my meeting"]):
         return "calendar_update"
@@ -491,7 +755,24 @@ def analyze_intent(user_input: str):
         return "send"
     
     # Fallback to regex patterns for complex cases
-    # Calendar patterns first (since they're new and should take precedence)
+    # Drive patterns first (since they're new and should take precedence for drive-related queries)
+    for pattern in drive_list_patterns:
+        if re.search(pattern, input_lower):
+            return "drive_list"
+    
+    for pattern in drive_create_patterns:
+        if re.search(pattern, input_lower):
+            return "drive_create"
+    
+    for pattern in drive_delete_patterns:
+        if re.search(pattern, input_lower):
+            return "drive_delete"
+    
+    for pattern in drive_share_patterns:
+        if re.search(pattern, input_lower):
+            return "drive_share"
+    
+    # Calendar patterns
     for pattern in calendar_create_patterns:
         if re.search(pattern, input_lower):
             return "calendar_create"
@@ -541,6 +822,12 @@ create_calendar_event_tool = FunctionTool(create_calendar_event)
 read_calendar_events_tool = FunctionTool(read_calendar_events)
 delete_calendar_event_tool = FunctionTool(delete_calendar_event)
 update_calendar_event_tool = FunctionTool(update_calendar_event)
+
+# Drive function tools
+list_drive_files_tool = FunctionTool(list_drive_files)
+create_drive_folder_tool = FunctionTool(create_drive_folder)
+delete_drive_file_tool = FunctionTool(delete_drive_file)
+share_drive_file_tool = FunctionTool(share_drive_file)
 
 # Create the Gemini model instance with API key
 api_key = os.getenv("GOOGLE_API_KEY")
@@ -660,6 +947,35 @@ calendar_update_agent = Agent(
     tools=[update_calendar_event_tool]
 )
 
+# Create specialized drive agents
+drive_list_agent = Agent(
+    name="drive_lister",
+    description="Specialized agent for listing and searching Google Drive files. Handles viewing, finding, and browsing files and folders in Google Drive.",
+    model=gemini_model,
+    tools=[list_drive_files_tool]
+)
+
+drive_create_agent = Agent(
+    name="drive_creator",
+    description="Specialized agent for creating folders in Google Drive. Handles making new folders and directories in Google Drive.",
+    model=gemini_model,
+    tools=[create_drive_folder_tool]
+)
+
+drive_delete_agent = Agent(
+    name="drive_deleter",
+    description="Specialized agent for deleting files and folders from Google Drive. Handles removal and trashing of Drive items.",
+    model=gemini_model,
+    tools=[delete_drive_file_tool]
+)
+
+drive_share_agent = Agent(
+    name="drive_sharer",
+    description="Specialized agent for sharing Google Drive files and folders. Handles granting access permissions to users.",
+    model=gemini_model,
+    tools=[share_drive_file_tool]
+)
+
 def route_email_request(user_input: str):
     """Routes the user request to the appropriate function based on intent analysis.
     
@@ -691,15 +1007,25 @@ def route_email_request(user_input: str):
     elif intent == 'calendar_update':
         return f"📅 Intent: CALENDAR UPDATE - This request would use the update_calendar_event function to modify an event. Request: '{user_input}'"
     
+    # Drive routing
+    elif intent == 'drive_list':
+        return f"💾 Intent: DRIVE LIST - This request would use the list_drive_files function to view Drive files. Request: '{user_input}'"
+    elif intent == 'drive_create':
+        return f"💾 Intent: DRIVE CREATE - This request would use the create_drive_folder function to make a new folder. Request: '{user_input}'"
+    elif intent == 'drive_delete':
+        return f"💾 Intent: DRIVE DELETE - This request would use the delete_drive_file function to remove a Drive file. Request: '{user_input}'"
+    elif intent == 'drive_share':
+        return f"💾 Intent: DRIVE SHARE - This request would use the share_drive_file function to share a Drive file. Request: '{user_input}'"
+    
     else:
-        return f"🎯 Intent: GENERAL - This is a general query. I can help you with emails (reading, sending, deleting, drafts) and calendar (creating, viewing, updating, deleting events). Request: '{user_input}'"
+        return f"🎯 Intent: GENERAL - This is a general query. I can help you with emails (reading, sending, deleting, drafts), calendar (creating, viewing, updating, deleting events), and Drive (listing files, creating folders, deleting files, sharing files). Request: '{user_input}'"
 
 # Create routing tool
 route_email_tool = FunctionTool(route_email_request)
 
 # Create a smart handler that covers both email and calendar requests
-def smart_email_calendar_handler(user_input: str):
-    """Handles email and calendar requests by analyzing intent and providing appropriate guidance.
+def smart_email_calendar_drive_handler(user_input: str):
+    """Handles email, calendar, and drive requests by analyzing intent and providing appropriate guidance.
     
     Args:
         user_input (str): The user's request or query.
@@ -729,16 +1055,26 @@ def smart_email_calendar_handler(user_input: str):
     elif intent == 'calendar_update':
         return f"✏️ I understand you want to update a calendar event. To help you with '{user_input}', I would use the update_calendar_event function. Please provide:\n1. The event ID of the event to update\n2. New title (optional)\n3. New start time (optional, ISO format)\n4. New end time (optional, ISO format)\n5. New description (optional)\n6. New location (optional)\n\nExample: update_calendar_event('event_id_here', 'New Meeting Title', '2024-01-15T14:00:00-07:00', '2024-01-15T15:00:00-07:00')"
     
+    # Drive intents
+    elif intent == 'drive_list':
+        return f"💾 I understand you want to list Drive files. To help you with '{user_input}', I would use the list_drive_files function. Please provide:\n1. Search query (optional, e.g., 'type:pdf' or 'name:report')\n2. Maximum number of files to show (optional, default: 10)\n\nExample: list_drive_files('type:pdf', 15) to find PDF files"
+    elif intent == 'drive_create':
+        return f"📁 I understand you want to create a Drive folder. To help you with '{user_input}', I would use the create_drive_folder function. Please provide:\n1. Folder name\n2. Parent folder ID (optional, defaults to root)\n\nExample: create_drive_folder('Project Files') to create a folder in root"
+    elif intent == 'drive_delete':
+        return f"🗑️ I understand you want to delete a Drive file/folder. To help you with '{user_input}', I would use the delete_drive_file function. Please provide:\n1. The file/folder ID to delete\n\nNote: You can find file IDs by first listing files with list_drive_files function."
+    elif intent == 'drive_share':
+        return f"🔗 I understand you want to share a Drive file. To help you with '{user_input}', I would use the share_drive_file function. Please provide:\n1. File ID to share\n2. Email address of the person to share with\n3. Permission level (optional: 'reader', 'writer', or 'owner', default: 'reader')\n\nExample: share_drive_file('file_id_here', 'user@example.com', 'writer')"
+    
     else:
-        return f"👋 Hello! I'm your assistant for emails and calendar management. I can help you with:\n\n📧 **Email Management**:\n• Reading emails: Search and retrieve emails from your inbox\n• Sending emails: Compose and send new messages\n• Deleting emails: Remove unwanted messages\n• Creating drafts: Save emails for later\n\n📅 **Calendar Management**:\n• Creating events: Schedule meetings, appointments, and events\n• Viewing events: See your upcoming schedule and events\n• Updating events: Modify existing meetings and appointments\n• Deleting events: Cancel meetings and remove events\n\nWhat would you like to do today?"
+        return f"👋 Hello! I'm your assistant for emails, calendar, and Google Drive management. I can help you with:\n\n📧 **Email Management**:\n• Reading emails: Search and retrieve emails from your inbox\n• Sending emails: Compose and send new messages\n• Deleting emails: Remove unwanted messages\n• Creating drafts: Save emails for later\n\n📅 **Calendar Management**:\n• Creating events: Schedule meetings, appointments, and events\n• Viewing events: See your upcoming schedule and events\n• Updating events: Modify existing meetings and appointments\n• Deleting events: Cancel meetings and remove events\n\n💾 **Google Drive Management**:\n• Listing files: Browse and search your Drive files and folders\n• Creating folders: Organize your files with new folders\n• Deleting files: Remove files and folders from Drive\n• Sharing files: Grant access to files and folders with others\n\nWhat would you like to do today?"
 
 # Create the smart handler tool
-smart_handler_tool = FunctionTool(smart_email_calendar_handler)
+smart_handler_tool = FunctionTool(smart_email_calendar_drive_handler)
 
-# Main unified agent with intelligent routing for both email and calendar operations
-email_calendar_agent = Agent(
-    name="email_calendar_agent",
-    description="""You are an intelligent assistant that helps users manage their Gmail account and Google Calendar. 
+# Main unified agent with intelligent routing for email, calendar, and drive operations
+email_calendar_drive_agent = Agent(
+    name="email_calendar_drive_agent",
+    description="""You are an intelligent assistant that helps users manage their Gmail account, Google Calendar, and Google Drive. 
 
 IMPORTANT: You have access to these functions:
 
@@ -753,6 +1089,12 @@ CALENDAR FUNCTIONS:
 - read_calendar_events(max_results, time_min, time_max): View upcoming calendar events
 - delete_calendar_event(event_id): Delete calendar events
 - update_calendar_event(event_id, summary, start_datetime, end_datetime, description, location): Update existing events
+
+DRIVE FUNCTIONS:
+- list_drive_files(query, max_results): List and search Drive files and folders
+- create_drive_folder(folder_name, parent_folder_id): Create new folders in Drive
+- delete_drive_file(file_id): Delete files and folders from Drive
+- share_drive_file(file_id, email, role): Share Drive files with others
 
 ANALYSIS FUNCTION:
 - analyze_intent(user_input): Analyze what the user wants to do
@@ -770,15 +1112,22 @@ CALENDAR OPERATIONS:
 7. For deleting events (keywords: delete, cancel, remove + event/meeting/appointment): Use delete_calendar_event()
 8. For updating events (keywords: update, change, reschedule, modify + event/meeting/appointment): Use update_calendar_event()
 
-9. For general greetings or help: Provide friendly assistance about both email and calendar capabilities
+DRIVE OPERATIONS:
+9. For listing files (keywords: list, show, find, browse + files/drive/documents): Use list_drive_files()
+10. For creating folders (keywords: create, make, new + folder/directory): Use create_drive_folder()
+11. For deleting files (keywords: delete, remove, trash + file/folder/document + drive): Use delete_drive_file()
+12. For sharing files (keywords: share, grant, give + access/permission): Use share_drive_file()
+
+13. For general greetings or help: Provide friendly assistance about email, calendar, and drive capabilities
 
 BEHAVIOR:
 - Always analyze the user's intent first using analyze_intent() if unclear
 - Use the most appropriate function based on the user's request
 - For email read requests, use reasonable defaults (query="" for all emails, num_emails=10)
 - For calendar read requests, use reasonable defaults (max_results=10 for upcoming events)
-- For send/draft/calendar create requests, ask for missing information
-- For delete requests, explain that you need message/event IDs (get them from read functions first)
+- For drive list requests, use reasonable defaults (query="" for all files, max_results=10)
+- For send/draft/calendar create/drive create requests, ask for missing information
+- For delete requests, explain that you need message/event/file IDs (get them from read/list functions first)
 - Be helpful and conversational while being efficient
 
 Your goal is to reduce API calls by using only the most relevant function for each request.""",
@@ -788,6 +1137,8 @@ Your goal is to reduce API calls by using only the most relevant function for ea
         read_emails_tool, send_email_tool, delete_email_tool, create_draft_tool,
         # Calendar tools
         create_calendar_event_tool, read_calendar_events_tool, delete_calendar_event_tool, update_calendar_event_tool,
+        # Drive tools
+        list_drive_files_tool, create_drive_folder_tool, delete_drive_file_tool, share_drive_file_tool,
         # Analysis tool
         analyze_intent_tool
     ]
@@ -795,11 +1146,13 @@ Your goal is to reduce API calls by using only the most relevant function for ea
 
 # Export all agents for potential direct access
 # Maintain backward compatibility
-email_agent = email_calendar_agent  # For backward compatibility
+email_agent = email_calendar_drive_agent  # For backward compatibility
+email_calendar_agent = email_calendar_drive_agent  # For calendar compatibility
 
 __all__ = [
-    'email_calendar_agent', # Main unified agent
-    'email_agent',         # Backward compatibility alias
+    'email_calendar_drive_agent', # Main unified agent
+    'email_agent',                # Backward compatibility alias
+    'email_calendar_agent',       # Calendar compatibility alias
     
     # Specialized email agents
     'read_agent',          # Specialized read agent
@@ -813,13 +1166,20 @@ __all__ = [
     'calendar_delete_agent',  # Calendar event deletion agent
     'calendar_update_agent',  # Calendar event update agent
     
+    # Specialized drive agents
+    'drive_list_agent',    # Drive file listing agent
+    'drive_create_agent',  # Drive folder creation agent
+    'drive_delete_agent',  # Drive file deletion agent
+    'drive_share_agent',   # Drive file sharing agent
+    
     # Utility functions
-    'route_email_request',    # Direct routing function (now handles calendar too)
+    'route_email_request',    # Direct routing function (now handles calendar and drive too)
     'analyze_intent'          # Intent analysis function
 ]
 
-print("✅ Email and Calendar agent system initialized with specialized routing")
+print("✅ Email, Calendar, and Drive agent system initialized with specialized routing")
 print("📧 Available email agents: read, send, delete, draft")
 print("📅 Available calendar agents: create, read, delete, update")
+print("💾 Available drive agents: list, create, delete, share")
 print("🎯 Main agent will automatically route requests to appropriate specialized functions")
-print("🔄 Backward compatibility maintained - 'email_agent' now includes calendar functionality")
+print("🔄 Backward compatibility maintained - 'email_agent' now includes calendar and drive functionality")
